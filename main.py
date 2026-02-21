@@ -137,21 +137,43 @@ def train_new_model():
     metric = evaluate.load("seqeval")
 
     def compute_metrics(p):
-        # NOTE: For speed during training, we use argmax on emissions.
-        # Ideally, we should use Viterbi here too, but argmax is a good proxy for progress.
         predictions, labels = p
-        predictions = np.argmax(predictions, axis=2)
+        # 'predictions' are the raw RoBERTa emissions of shape (batch_size, seq_len, num_labels)
+        # We need to move them to the GPU so the CRF can process them
+        emissions = torch.tensor(predictions, device=model.device)
 
-        true_predictions = [
-            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
-        true_labels = [
-            [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
+        # 1. Enforce our strict transition rules before evaluating!
+        if hasattr(model, '_apply_transition_constraints'):
+            model._apply_transition_constraints()
+
+        # 2. Decode using Viterbi (Returns a List of Lists containing the best tag IDs)
+        # We pass the full emissions. We will filter out the padding (-100) manually below.
+        with torch.no_grad():
+            best_tags_list = model.crf.decode(emissions)
+
+        true_predictions = []
+        true_labels = []
+
+        # 3. Align the Viterbi output with the actual labels, ignoring -100 padding
+        for pred_seq, label_seq in zip(best_tags_list, labels):
+            pred_list = []
+            label_list_filtered = []
+
+            for p_tag, l_tag in zip(pred_seq, label_seq):
+                if l_tag != -100:
+                    pred_list.append(label_list[p_tag])
+                    label_list_filtered.append(label_list[l_tag])
+
+            true_predictions.append(pred_list)
+            true_labels.append(label_list_filtered)
+
         results = metric.compute(predictions=true_predictions, references=true_labels)
+
+        # RETURN PRECISION AND RECALL TOO!
+        # This is vital so you can watch those False Positives drop in real-time.
         return {
+            "precision": results["overall_precision"],
+            "recall": results["overall_recall"],
             "f1": results["overall_f1"],
             "accuracy": results["overall_accuracy"],
         }

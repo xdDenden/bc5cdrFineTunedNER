@@ -22,6 +22,26 @@ class RobertaWithCRF(RobertaPreTrainedModel):
 
         self.post_init()
 
+    def _apply_transition_constraints(self):
+        """
+        Forcefully penalize illegal BIO transitions so Viterbi avoids them.
+        Tags: "O": 0, "B-Chemical": 1, "B-Disease": 2, "I-Disease": 3, "I-Chemical": 4
+        """
+        with torch.no_grad():
+            # Prevent O -> Inside
+            self.crf.transitions[0, 3] = -10000.0  # O -> I-Disease
+            self.crf.transitions[0, 4] = -10000.0  # O -> I-Chemical
+
+            # Prevent Cross-Entity Jumps
+            self.crf.transitions[1, 3] = -10000.0  # B-Chemical -> I-Disease
+            self.crf.transitions[2, 4] = -10000.0  # B-Disease -> I-Chemical
+            self.crf.transitions[4, 3] = -10000.0  # I-Chemical -> I-Disease
+            self.crf.transitions[3, 4] = -10000.0  # I-Disease -> I-Chemical
+
+            # Prevent sequences from starting with an 'Inside' tag
+            self.crf.start_transitions[3] = -10000.0 # Start -> I-Disease
+            self.crf.start_transitions[4] = -10000.0 # Start -> I-Chemical
+
     def forward(
             self,
             input_ids=None,
@@ -40,6 +60,9 @@ class RobertaWithCRF(RobertaPreTrainedModel):
         sequence_output = outputs[0]
         sequence_output = self.dropout(sequence_output)
         emissions = self.classifier(sequence_output)
+
+        # Apply constraints before calculating the loss
+        self._apply_transition_constraints()
 
         loss = None
         if labels is not None:
@@ -70,6 +93,8 @@ class RobertaWithCRF(RobertaPreTrainedModel):
         emissions = self.classifier(outputs[0])
         mask = attention_mask.type(torch.uint8) if attention_mask is not None else None
 
-        # This returns the best tag SEQUENCE (List of Lists), not just numbers
+        # Apply constraints before decoding
+        self._apply_transition_constraints()
+
         best_tags_list = self.crf.decode(emissions, mask=mask)
         return best_tags_list
